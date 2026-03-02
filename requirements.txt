@@ -1,0 +1,12 @@
+PIL
+cv2
+insightface
+matplotlib
+mediapipe
+numpy
+sklearn
+src
+torch
+torchvision
+tqdm
+yaml

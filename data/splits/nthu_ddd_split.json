@@ -1,0 +1,26 @@
+{
+    "train": [
+        "subject005",
+        "subject006",
+        "subject008",
+        "subject012",
+        "subject013",
+        "subject020",
+        "subject023",
+        "subject024",
+        "subject031",
+        "subject033",
+        "subject035",
+        "subject036"
+    ],
+    "val": [
+        "subject032",
+        "subject034"
+    ],
+    "test": [
+        "subject001",
+        "subject002",
+        "subject009",
+        "subject015"
+    ]
+}

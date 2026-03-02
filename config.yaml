@@ -1,0 +1,71 @@
+# config.yaml — Centralised hyperparameter config
+# All paths are relative to the project root (Drowsiness Detection/).
+# Activate env: conda activate webenv
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────────────────────────────────────
+data:
+  clips_root:      "dataset/clips"
+  landmarks_root:  "dataset/landmarks_cropped"
+  splits_dir:      "data/splits"
+  use_landmarks:   true
+  uta_fold:        0          # which UTA-RLDD fold to use as test (0-4)
+  # Leave null to use all datasets; or list e.g. ["nthu_ddd", "nitymed"]
+  datasets: null
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────────────────────────────────────
+model:
+  num_classes:      2          # 2 = binary (alert / drowsy)
+  lstm_layers:      1          # 1 or 2 stacked LSTM layers
+  lstm_hidden:      256
+  lstm_input_size:  512        # projection size from CNN spatial features
+  use_landmarks:    true
+  lm_hidden:        64
+  dropout:          0.3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────────────────────────────────────
+training:
+  seed:            42
+  epochs:          30
+  batch_size:      32
+  num_workers:     4           # set to 0 on Windows if DataLoader hangs
+  learning_rate:   0.0001      # 1e-4, cosine decay
+  weight_decay:    0.0001
+  use_amp:         true        # mixed precision (torch.cuda.amp)
+  use_focal_loss:  false       # true = focal loss; false = weighted BCE
+  focal_gamma:     2.0
+  early_stop_patience: 12      # stop if val-F1 doesn't improve for N epochs
+  grad_clip:       1.0         # gradient clipping max norm (0 = disabled)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduler
+# ─────────────────────────────────────────────────────────────────────────────
+scheduler:
+  type:    "cosine"            # "cosine" | "step" | "none"
+  T_max:   30                 # for cosine: number of epochs
+  eta_min: 0.000001            # minimum LR
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────────────────────────────────────────
+paths:
+  checkpoints:  "results/checkpoints"
+  logs:         "results/logs"
+  plots:        "results/plots"
+  best_model:   "results/checkpoints/best_model.pt"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference / Webcam demo
+# ─────────────────────────────────────────────────────────────────────────────
+inference:
+  model_path:         "results/checkpoints/best_model.pt"
+  camera_index:       0
+  alert_threshold:    0.5      # drowsy probability threshold
+  buffer_size:        16       # T — frames in rolling window
+  inference_stride:   2        # run model every N frames
+  display_ear_mor:    true

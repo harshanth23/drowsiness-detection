@@ -1,0 +1,54 @@
+# experiments/exp_A.yaml
+# Experiment A: Train on NTHU-DDD + YawDD, Test (unseen) on UTA-RLDD + NITYMED
+# Run: python src/cross_train.py --config experiments/exp_A.yaml
+
+cross:
+  name:            "exp_A"
+  train_datasets:  ["nthu_ddd", "yawdd"]
+  test_datasets:   ["uta_rldd", "nitymed"]
+  description:     "Train NTHU+YawDD → Test UTA+NITYMED"
+
+# ─── Data (shared settings) ───────────────────────────────────────────────────
+data:
+  clips_root:      "dataset/clips"
+  landmarks_root:  "dataset/landmarks_cropped"
+  splits_dir:      "data/splits"
+  use_landmarks:   true
+  uta_fold:        0
+
+# ─── Model ────────────────────────────────────────────────────────────────────
+model:
+  num_classes:      2
+  lstm_layers:      1
+  lstm_hidden:      256
+  lstm_input_size:  512
+  use_landmarks:    true
+  lm_hidden:        64
+  dropout:          0.3
+
+# ─── Training ─────────────────────────────────────────────────────────────────
+training:
+  seed:                42
+  epochs:              30
+  batch_size:          32
+  #num_workers:         4
+  learning_rate:       0.0001
+  weight_decay:        0.0001
+  use_amp:             true
+  use_focal_loss:      false
+  focal_gamma:         2.0
+  early_stop_patience: 7
+  grad_clip:           1.0
+
+# ─── Scheduler ────────────────────────────────────────────────────────────────
+scheduler:
+  type:    "cosine"
+  T_max:   30
+  eta_min: 0.000001
+
+# ─── Output paths (namespaced under cross_eval/exp_A/) ────────────────────────
+paths:
+  checkpoints:  "results/cross_eval/exp_A/checkpoints"
+  logs:         "results/cross_eval/exp_A/logs"
+  plots:        "results/cross_eval/exp_A/plots"
+  best_model:   "results/cross_eval/exp_A/checkpoints/best_model.pt"

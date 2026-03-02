@@ -1,0 +1,30 @@
+{
+    "train": [
+        "normal/41-FemaleGlasses-Normal",
+        "normal/43-MaleNoGlasses-Normal",
+        "normal/47-MaleNoGlasses-Normal",
+        "yawning/11-MaleGlasses-Yawning",
+        "yawning/31-FemaleGlasses-Yawning",
+        "yawning/36-FemaleNoGlasses-Yawning",
+        "yawning/38-FemaleNoGlasses-Yawning",
+        "yawning/39-MaleGlasses-Yawning",
+        "yawning/40-MaleNoGlasses-Yawning",
+        "yawning/41-MaleNoGlasses-Yawning",
+        "yawning/42-MaleNoGlasses-Yawning",
+        "yawning/43-FemaleNoGlasses-Yawning",
+        "yawning/43-MaleNoGlasses-Yawning",
+        "yawning/44-MaleNoGlasses-Yawning",
+        "yawning/47-MaleNoGlasses-Yawning"
+    ],
+    "val": [
+        "normal/36-FemaleNoGlasses-Normal",
+        "normal/40-MaleNoGlasses-Normal"
+    ],
+    "test": [
+        "normal/30-FemaleNoGlasses-Normal",
+        "normal/31-FemaleGlasses-Normal",
+        "yawning/30-FemaleNoGlasses-Yawning",
+        "yawning/40-FemaleNoGlasses-Yawning",
+        "yawning/41-FemaleGlasses-Yawning"
+    ]
+}

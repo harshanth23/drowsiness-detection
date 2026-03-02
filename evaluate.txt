@@ -1,0 +1,309 @@
+# Allow `python src/evaluate.py` to resolve `from src.*` imports
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+"""
+src/evaluate.py — Model Evaluation
+-------------------------------------
+Computes per-dataset metrics on held-out test subjects and saves plots.
+
+Usage:
+    conda activate webenv
+    python src/evaluate.py                          # uses config.yaml
+    python src/evaluate.py --model results/checkpoints/best_model.pt
+
+Outputs (saved to results/plots/):
+  • Confusion matrix PNG (per dataset + combined)
+  • ROC curve + AUC PNG
+  • Metrics CSV summary
+  • Inference FPS benchmark
+"""
+
+import argparse
+import os
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.cuda.amp import autocast
+import yaml
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix,
+    f1_score, precision_score, recall_score, roc_auc_score, roc_curve,
+)
+
+from src.dataset import (
+    DrowsinessClipDataset, _eval_transform, build_records,
+    _DATASET_CONFIGS,
+)
+from src.model import DrowsinessModel
+from src.utils import get_device, load_checkpoint, set_seed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def run_inference(
+    model:          nn.Module,
+    loader,
+    device:         torch.device,
+    use_amp:        bool = True,
+    use_landmarks:  bool = True,
+) -> Tuple[List[int], List[int], List[float]]:
+    """Returns (all_labels, all_preds, all_probs_cls1)."""
+    model.eval()
+    all_labels, all_preds, all_probs = [], [], []
+
+    for clips, lms, labels in loader:
+        clips  = clips.to(device, non_blocking=True)
+        lms    = lms.to(device, non_blocking=True) if use_landmarks else None
+
+        with autocast(enabled=use_amp):
+            logits = model(clips, lms)
+            probs  = torch.softmax(logits, dim=1)
+
+        preds = probs.argmax(dim=1).cpu().tolist()
+        all_labels.extend(labels.tolist())
+        all_preds.extend(preds)
+        all_probs.extend(probs[:, 1].cpu().tolist())   # prob of class 1 (drowsy)
+
+    return all_labels, all_preds, all_probs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CLASS_NAMES = ["Alert", "Drowsy"]
+
+
+def plot_confusion_matrix(
+    labels:    List[int],
+    preds:     List[int],
+    save_path: str,
+    title:     str = "Confusion Matrix",
+    class_names: List[str] = _CLASS_NAMES,
+) -> None:
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    cm = confusion_matrix(labels, preds)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    fig.colorbar(im, ax=ax)
+    ax.set(
+        xticks=range(len(class_names)), yticks=range(len(class_names)),
+        xticklabels=class_names, yticklabels=class_names,
+        xlabel="Predicted", ylabel="True", title=title,
+    )
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, cm[i, j], ha="center", va="center",
+                    color="white" if cm[i, j] > cm.max() / 2 else "black")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"  [eval] confusion matrix → {save_path}")
+
+
+def plot_roc_curve(
+    labels:    List[int],
+    probs:     List[float],
+    save_path: str,
+    title:     str = "ROC Curve",
+) -> float:
+    """Returns AUC."""
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        auc = roc_auc_score(labels, probs)
+        fpr, tpr, _ = roc_curve(labels, probs)
+        plt.figure(figsize=(6, 5))
+        plt.plot(fpr, tpr, lw=2, label=f"AUC = {auc:.3f}")
+        plt.plot([0, 1], [0, 1], "k--", lw=1)
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+        print(f"  [eval] ROC AUC={auc:.3f} → {save_path}")
+        return auc
+    except Exception as e:
+        print(f"  [eval] ROC skipped: {e}")
+        return float("nan")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FPS benchmark
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def benchmark_fps(
+    model:  nn.Module,
+    device: torch.device,
+    T:      int = 16,
+    H:      int = 112,
+    W:      int = 112,
+    n_runs: int = 200,
+    use_lm: bool = True,
+) -> float:
+    model.eval()
+    clip = torch.randn(1, 3, T, H, W, device=device)
+    lms  = torch.randn(1, T, 2,       device=device) if use_lm else None
+
+    # Warm-up
+    for _ in range(10):
+        _ = model(clip, lms)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(n_runs):
+        _ = model(clip, lms)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    elapsed = time.perf_counter() - t0
+    fps = n_runs / elapsed
+    print(f"  [fps] {fps:.1f} clips/sec  ({n_runs} runs, device={device})")
+    return fps
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-dataset evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_dataset(
+    ds_name:       str,
+    model:         nn.Module,
+    config:        dict,
+    device:        torch.device,
+    plots_dir:     str,
+    use_amp:       bool = True,
+) -> Dict:
+    from torch.utils.data import DataLoader
+
+    data_cfg = config["data"]
+    use_lm   = data_cfg.get("use_landmarks", True)
+    uta_fold = data_cfg.get("uta_fold", 0)
+
+    records = build_records(
+        clips_root     = data_cfg["clips_root"],
+        landmarks_root = data_cfg.get("landmarks_root", "dataset/landmarks_cropped"),
+        splits_dir     = data_cfg.get("splits_dir", "data/splits"),
+        split          = "test",
+        use_landmarks  = use_lm,
+        uta_fold       = uta_fold,
+        datasets       = [ds_name],
+    )
+
+    if len(records) == 0:
+        print(f"  [{ds_name}] no test records found, skipping.")
+        return {}
+
+    dataset = DrowsinessClipDataset(records, _eval_transform(), use_landmarks=use_lm)
+    loader  = DataLoader(dataset, batch_size=8, shuffle=False,
+                         num_workers=config["training"].get("num_workers", 0),
+                         pin_memory=True)
+
+    labels, preds, probs = run_inference(model, loader, device, use_amp, use_lm)
+
+    acc  = accuracy_score(labels, preds)
+    prec = precision_score(labels, preds, average="macro", zero_division=0)
+    rec  = recall_score   (labels, preds, average="macro", zero_division=0)
+    f1   = f1_score       (labels, preds, average="macro", zero_division=0)
+
+    print(f"\n  [{ds_name}] acc={acc:.3f}  prec={prec:.3f}  rec={rec:.3f}  F1={f1:.3f}")
+    print(classification_report(labels, preds, target_names=_CLASS_NAMES, zero_division=0))
+
+    ds_plots = os.path.join(plots_dir, ds_name)
+    plot_confusion_matrix(labels, preds,
+                          os.path.join(ds_plots, "confusion_matrix.png"),
+                          title=f"Confusion Matrix — {ds_name}")
+    auc = plot_roc_curve(labels, probs,
+                         os.path.join(ds_plots, "roc_curve.png"),
+                         title=f"ROC Curve — {ds_name}")
+
+    return {
+        "dataset": ds_name, "n_clips": len(labels),
+        "accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "auc": auc,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main evaluation function
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate(config: dict, model_path: Optional[str] = None) -> None:
+    device = get_device()
+    set_seed(config["training"].get("seed", 42))
+
+    # Load model
+    print("\n[eval] Loading model …")
+    model = DrowsinessModel.from_config(config).to(device)
+    ckpt_path = model_path or config["paths"].get("best_model", "results/checkpoints/best_model.pt")
+    load_checkpoint(ckpt_path, model, device=str(device))
+    use_amp = config["training"].get("use_amp", True) and device.type == "cuda"
+
+    plots_dir = config["paths"].get("plots", "results/plots")
+
+    # ── Per-dataset evaluation ────────────────────────────────────────────────
+    ds_list   = config["data"].get("datasets") or list(_DATASET_CONFIGS.keys())
+    all_rows  = []
+
+    for ds_name in ds_list:
+        row = evaluate_dataset(ds_name, model, config, device, plots_dir, use_amp)
+        if row:
+            all_rows.append(row)
+
+    # ── Combined confusion matrix ─────────────────────────────────────────────
+    if all_rows:
+        import csv
+        csv_path = os.path.join(plots_dir, "metrics_summary.csv")
+        Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=all_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(all_rows)
+        print(f"\n  [eval] metrics summary → {csv_path}")
+
+        # Print combined table
+        print("\n" + "=" * 65)
+        print(f"{'Dataset':<14} {'N':>6} {'Acc':>6} {'Prec':>6} {'Rec':>6} {'F1':>6} {'AUC':>6}")
+        print("-" * 65)
+        for r in all_rows:
+            print(f"{r['dataset']:<14} {r['n_clips']:>6} {r['accuracy']:>6.3f} "
+                  f"{r['precision']:>6.3f} {r['recall']:>6.3f} {r['f1']:>6.3f} "
+                  f"{r.get('auc', float('nan')):>6.3f}")
+        print("=" * 65)
+
+    # ── FPS benchmark ─────────────────────────────────────────────────────────
+    print("\n[fps] Running inference speed benchmark …")
+    use_lm = config["data"].get("use_landmarks", True)
+    fps    = benchmark_fps(model, device, use_lm=use_lm)
+    print(f"  Throughput: {fps:.1f} clips/sec  |  ~{fps * 16:.1f} frames/sec")
+
+    print("\n✅ Evaluation complete.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry-point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Evaluate Drowsiness Detection Model")
+    p.add_argument("--config", type=str, default="config.yaml")
+    p.add_argument("--model",  type=str, default=None,
+                   help="Path to model checkpoint (overrides config)")
+    args = p.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    evaluate(cfg, args.model)

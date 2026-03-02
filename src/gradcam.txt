@@ -1,0 +1,326 @@
+# Allow `python src/gradcam.py` to resolve `from src.*` imports
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+"""
+src/gradcam.py — Grad-CAM Visualisation for 3D-CNN
+-----------------------------------------------------
+Generates per-frame saliency heatmaps from the last Conv3D block.
+
+Usage:
+    conda activate webenv
+    python src/gradcam.py --clip dataset/clips/nthu_ddd/subject001/alert/clip0000 \\
+                          --model results/checkpoints/best_model.pt
+
+Outputs:
+  • results/plots/gradcam/<clip_name>/  — per-frame heatmap overlays
+  • results/plots/gradcam/<clip_name>/gradcam_grid.png  — 4×N grid
+"""
+
+import argparse
+import os
+from pathlib import Path
+from typing import List, Optional
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+import yaml
+from PIL import Image
+
+from src.dataset import T_FRAMES, FRAME_SIZE, _eval_transform
+from src.model import DrowsinessModel
+from src.utils import get_device, load_checkpoint
+
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+# ──────────────────────────────────────────────────────────
+# Grad-CAM hook
+# ──────────────────────────────────────────────────────────
+
+class GradCAM3D:
+    """
+    Attaches forward/backward hooks to a target module and computes
+    class-discriminative activation maps (Grad-CAM).
+
+    IMPORTANT: Hook is registered on the *ConvBlock3D* (whole block),
+    so we capture the block's output (after Conv→BN→ReLU→Pool→Dropout)
+    which is at spatial resolution (T', H', W').  This matches what the
+    gradients flow back through and gives consistent activation maps.
+    """
+
+    def __init__(self, model: DrowsinessModel, target_layer: torch.nn.Module):
+        self.model = model
+        self.activations: Optional[torch.Tensor] = None
+        self.gradients:   Optional[torch.Tensor] = None
+
+        # forward hook: save the block output (feature maps)
+        self._fwd_hook = target_layer.register_forward_hook(self._save_activations)
+        # backward hook: save gradients flowing back into this block
+        self._bwd_hook = target_layer.register_full_backward_hook(self._save_gradients)
+
+    def _save_activations(self, module, inp, output):
+        # output: (B, C, T', H', W')
+        self.activations = output.detach().clone()
+
+    def _save_gradients(self, module, grad_input, grad_output):
+        # grad_output[0]: gradient of loss w.r.t. the *output* of this layer
+        self.gradients = grad_output[0].detach().clone()
+
+    def remove_hooks(self):
+        self._fwd_hook.remove()
+        self._bwd_hook.remove()
+
+    @torch.enable_grad()
+    def generate(
+        self,
+        clip:      torch.Tensor,           # (1, 3, T, H, W)
+        landmarks: Optional[torch.Tensor],
+        class_idx: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Returns a (T, H, W) float32 heatmap in [0, 1], upsampled to
+        match the original clip's spatial and temporal dimensions.
+
+        cuDNN RNNs (LSTM) require training mode for backward().  We put
+        the whole model in train() but zero-out all Dropout layers so
+        they behave as identity (no randomness) during the GradCAM pass.
+        """
+        # -- Switch to train mode (required by cuDNN LSTM backward) ---------
+        self.model.train()
+        # Disable every Dropout layer so activations are deterministic
+        dropout_states: list = []
+        for m in self.model.modules():
+            if isinstance(m, (torch.nn.Dropout, torch.nn.Dropout2d,
+                               torch.nn.Dropout3d, torch.nn.AlphaDropout)):
+                dropout_states.append((m, m.p))
+                m.p = 0.0
+
+        # Forward pass
+        logits = self.model(clip, landmarks)
+        probs  = torch.softmax(logits, dim=1)
+        pred   = logits.argmax(dim=1).item()
+        label  = "Drowsy" if pred == 1 else "Alert"
+        print(f"  [gradcam] pred={label}  Alert={probs[0,0]:.3f}  Drowsy={probs[0,1]:.3f}")
+
+        if class_idx is None:
+            class_idx = pred
+
+        # Backward for the chosen class score
+        self.model.zero_grad()
+        logits[0, class_idx].backward()
+
+        # ---------------------------------------------------------
+        # Sanity check
+        # ---------------------------------------------------------
+        if self.gradients is None or self.activations is None:
+            raise RuntimeError(
+                "Grad-CAM hooks did not fire. "
+                "Check that the target_layer is actually used during forward."
+            )
+
+        grads = self.gradients   # (1, C, T', H', W')
+        acts  = self.activations # (1, C, T', H', W')
+
+        # Global-average-pool the gradients over spatial+temporal dims → channel weights
+        weights = grads.mean(dim=(2, 3, 4), keepdim=True)  # (1, C, 1, 1, 1)
+
+        # Weighted combination of activation maps
+        cam = (weights * acts).sum(dim=1)   # (1, T', H', W')
+        cam = torch.relu(cam)               # keep only positive influence
+        cam = cam[0]                        # (T', H', W')
+
+        # Upsample to full clip dimensions (T, H, W) using trilinear interpolation
+        cam = cam.unsqueeze(0).unsqueeze(0)  # (1, 1, T', H', W')
+        cam = F.interpolate(
+            cam,
+            size=(T_FRAMES, FRAME_SIZE, FRAME_SIZE),
+            mode="trilinear",
+            align_corners=False,
+        )
+        cam = cam[0, 0].cpu().numpy()        # (T, H, W)
+
+        # Normalise to [0, 1]
+        cam_min, cam_max = cam.min(), cam.max()
+        if cam_max - cam_min > 1e-8:
+            cam = (cam - cam_min) / (cam_max - cam_min)
+        else:
+            cam = np.zeros_like(cam)
+
+        # -- Restore original dropout probabilities + eval mode -------------
+        for m, p_orig in dropout_states:
+            m.p = p_orig
+        self.model.eval()
+
+        return cam   # (T, H, W) float32 in [0, 1]
+
+
+# ──────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────
+
+def _load_clip(clip_dir: str) -> torch.Tensor:
+    """Load a clip directory into a (1, 3, T, H, W) tensor."""
+    tfm = _eval_transform()
+    clip_path = Path(clip_dir)
+    frame_files = sorted(clip_path.glob("*.jpg"))
+    if not frame_files:
+        frame_files = sorted(clip_path.glob("*.png"))
+    if not frame_files:
+        raise FileNotFoundError(f"No .jpg/.png frames found in: {clip_dir}")
+
+    # Pad short clips by repeating last frame; truncate long clips
+    if len(frame_files) < T_FRAMES:
+        frame_files = frame_files + [frame_files[-1]] * (T_FRAMES - len(frame_files))
+    frame_files = frame_files[:T_FRAMES]
+
+    frames = [tfm(Image.open(fp).convert("RGB")) for fp in frame_files]
+    clip_tensor = torch.stack(frames, dim=1).unsqueeze(0)  # (1, 3, T, H, W)
+    return clip_tensor
+
+
+def _denorm_frame(tensor: torch.Tensor) -> np.ndarray:
+    """Convert a normalized CHW tensor → HWC uint8 RGB image."""
+    img = tensor.detach().cpu().float().numpy().transpose(1, 2, 0)  # HWC
+    img = img * _STD + _MEAN
+    img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    return img  # RGB uint8
+
+
+def _overlay_heatmap(
+    frame_rgb: np.ndarray,   # (H, W, 3) uint8 RGB
+    cam:       np.ndarray,   # (H, W) float32 in [0, 1]
+    alpha:     float = 0.50,
+) -> np.ndarray:
+    """
+    Blend a Grad-CAM heatmap onto an RGB frame.
+    Returns an (H, W, 3) uint8 RGB image.
+    """
+    # Build JET heatmap in BGR then convert to RGB
+    heatmap_bgr = cv2.applyColorMap(
+        np.uint8(cam * 255), cv2.COLORMAP_JET
+    )                                          # (H, W, 3) BGR
+    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+
+    # Weighted blend: more heatmap, less original
+    overlay = (alpha * heatmap_rgb.astype(np.float32)
+                + (1.0 - alpha) * frame_rgb.astype(np.float32))
+    return np.clip(overlay, 0, 255).astype(np.uint8)  # RGB uint8
+
+
+def _save_individual_frame(frame_rgb: np.ndarray, out_path: str) -> None:
+    """Save an RGB frame as BGR JPEG."""
+    cv2.imwrite(out_path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+
+
+def _save_grid(frames: List[np.ndarray], save_path: str, cols: int = 4) -> None:
+    """
+    Tile frames into a W×H grid PNG.
+    Pads the last row with black frames if needed.
+    """
+    rows = (len(frames) + cols - 1) // cols
+    row_imgs = []
+    for r in range(rows):
+        batch = frames[r * cols: (r + 1) * cols]
+        # Pad to full row width with black frames
+        while len(batch) < cols:
+            batch.append(np.zeros_like(frames[0]))
+        row_imgs.append(np.concatenate(batch, axis=1))
+    grid_rgb = np.concatenate(row_imgs, axis=0)
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(save_path, cv2.cvtColor(grid_rgb, cv2.COLOR_RGB2BGR))
+    print(f"  [gradcam] grid -> {save_path}")
+
+
+# ──────────────────────────────────────────────────────────
+# Main runner
+# ──────────────────────────────────────────────────────────
+
+def run_gradcam(
+    clip_dir:   str,
+    model_path: str,
+    config:     dict,
+    out_dir:    str = "results/plots/gradcam",
+    class_idx:  Optional[int] = None,
+) -> None:
+    device = get_device()
+    use_lm = config["data"].get("use_landmarks", True)
+
+    # ── Load model ──────────────────────────────────────────
+    model = DrowsinessModel.from_config(config).to(device)
+    load_checkpoint(model_path, model, device=str(device))
+    model.eval()  # keep eval mode throughout
+
+    # ── Target layer: the *entire* block4 (ConvBlock3D module) ──
+    # Hooking the whole block captures its output tensor at (B, 128, T', 7, 7)
+    # and the gradient of the loss with respect to that output.
+    # This is the standard Grad-CAM target for the last feature-extraction stage.
+    target_layer = model.backbone.block4
+    print(f"  [gradcam] target layer: {target_layer.__class__.__name__} (backbone.block4)")
+
+    grad_cam = GradCAM3D(model, target_layer)
+
+    # ── Load clip ────────────────────────────────────────────
+    clip = _load_clip(clip_dir).to(device)
+    lms  = torch.zeros(1, T_FRAMES, 2, device=device)  # zero landmarks (placeholder)
+
+    # ── Generate Grad-CAM ────────────────────────────────────
+    cam_map = grad_cam.generate(clip, lms if use_lm else None, class_idx=class_idx)
+    grad_cam.remove_hooks()
+    # cam_map: (T, H, W) = (16, 112, 112) float32 [0,1]
+
+    # Resolve which class was actually visualised (generate() picks argmax if class_idx=None)
+    _CLASS_NAMES = {0: "alert", 1: "drowsy"}
+    if class_idx is None:
+        with torch.no_grad():
+            model.eval()
+            _logits  = model(clip, lms if use_lm else None)
+            _resolved = int(_logits.argmax(dim=1).item())
+    else:
+        _resolved = class_idx
+    class_label = _CLASS_NAMES.get(_resolved, f"class{_resolved}")
+    print(f"  [gradcam] visualising: {class_label} (class_idx={_resolved})")
+
+    # ── Save per-frame overlays ──────────────────────────────
+    # Class label is a subfolder so alert/drowsy GradCAMs never overwrite each other.
+    clip_name = Path(clip_dir).name
+    out_path  = Path(out_dir) / clip_name / class_label
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    overlays: List[np.ndarray] = []
+    for t in range(T_FRAMES):
+        frame_rgb = _denorm_frame(clip[0, :, t])              # (112, 112, 3) RGB
+        overlay   = _overlay_heatmap(frame_rgb, cam_map[t])   # (112, 112, 3) RGB
+        out_file  = str(out_path / f"frame_{t:03d}_gradcam.jpg")
+        _save_individual_frame(overlay, out_file)
+        overlays.append(overlay)
+
+    _save_grid(overlays, str(out_path / "gradcam_grid.png"))
+    print(f"  [gradcam] {T_FRAMES} frames saved -> {out_path}/")
+
+
+# ──────────────────────────────────────────────────────────
+# CLI entry-point
+# ──────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Grad-CAM visualisation for the Drowsiness Model")
+    p.add_argument("--clip",      required=True,  help="Path to a clip directory (frames as .jpg/.png)")
+    p.add_argument("--model",     required=True,  help="Path to checkpoint (.pt)")
+    p.add_argument("--config",    default="config.yaml", help="Path to config.yaml")
+    p.add_argument("--class_idx", type=int, default=None,
+                   help="Class to visualise: 0=Alert, 1=Drowsy (default: argmax of prediction)")
+    p.add_argument("--out_dir",   default="results/plots/gradcam",
+                   help="Output directory for gradcam images")
+    p.add_argument("--alpha",     type=float, default=0.5,
+                   help="Heatmap blend strength [0..1] (default: 0.5)")
+    args = p.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    run_gradcam(args.clip, args.model, cfg, args.out_dir, args.class_idx)
