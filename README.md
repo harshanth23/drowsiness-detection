@@ -13,7 +13,7 @@ The drowsiness-detection project is a PyTorch and scikit-learn based system desi
 * Employs scikit-learn for data preprocessing, feature extraction, and model evaluation
 * Implements facial landmark detection using dlib and OpenCV to calculate the eye aspect ratio (EAR)
 * Includes data augmentation techniques to enhance the robustness of the model
-* Achieves an accuracy of 95% on the test dataset
+* Achieves an accuracy of 82% on the test dataset
 * Supports real-time video processing for drowsiness detection
 * Provides a customizable alarm system that can be integrated with various applications
 * Utilizes techniques such as transfer learning and fine-tuning to improve model performance
@@ -31,11 +31,6 @@ The drowsiness-detection project is a PyTorch and scikit-learn based system desi
 ## 📁 Project Structure
 ```markdown
 drowsiness-detection
-├── data
-│   ├── cross_eval
-│   ├── acc_train
-│   ├── acc_val
-│   ├── loss_train
 ├── dataset
 ├── experiments
 ├── preprocessing
@@ -63,7 +58,7 @@ Replace `path_to_video_file` with the actual path to the video file you want to 
 The dataset used for this project consists of images of faces with varying expressions, poses, and lighting conditions. The dataset is not provided with the project, but it can be downloaded from [insert dataset download link]. Once downloaded, place the dataset in the `data` directory.
 
 ## 📈 Results
-The trained model achieves an accuracy of 95% on the test dataset. The system's performance is evaluated using metrics such as precision, recall, and F1-score. The confusion matrix is used to analyze the system's performance and identify areas for improvement. The demo output shows the system's ability to detect drowsiness in real-time video processing.
+The trained model achieves an accuracy of 82% on the test dataset. The system's performance is evaluated using metrics such as precision, recall, and F1-score. The confusion matrix is used to analyze the system's performance and identify areas for improvement. The demo output shows the system's ability to detect drowsiness in real-time video processing.
 
 ## 🤝 Contributing
 To contribute to this project, please follow these steps:
