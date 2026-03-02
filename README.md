@@ -1,6 +1,6 @@
 # drowsiness-detection
 
-The drowsiness-detection project is currently in its initial stages, with no codebase established yet, providing a blank canvas for developers to contribute and shape its direction. As the project evolves, this repository will serve as a central hub for tracking progress, sharing updates, and collaborating on the development of a drowsiness detection system.
+The drowsiness-detection project aims to develop an innovative solution for detecting drowsiness, with the goal of improving safety and reducing accidents. This repository will serve as the central hub for the project's development, where the codebase and related resources will be maintained and updated as the project progresses.
 
 ## Features
 
