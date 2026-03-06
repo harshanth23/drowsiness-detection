@@ -1,12 +1,12 @@
-PIL
-cv2
 insightface
 matplotlib
 mediapipe
 numpy
-sklearn
-src
+opencv-python
+Pillow
+PyYAML
+scikit-learn
+tensorboard
 torch
 torchvision
 tqdm
-yaml

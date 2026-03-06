@@ -224,7 +224,9 @@ def run_realtime(config: dict) -> None:
             label, score, ear_val, mor_val, fps_ema,
             last_bbox,
         )
-        cv2.imshow("Drowsiness Detection — press Q to quit", out_frame)
+        # Attempt to bypass Qt rendering bug giving a black screen by specifying WINDOW_NORMAL
+        cv2.namedWindow("Drowsiness Detection - press Q to quit", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.imshow("Drowsiness Detection - press Q to quit", out_frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
